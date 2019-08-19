@@ -1,0 +1,708 @@
+###################################################################################
+#  Copyright 2019 Amazon.com, Inc. or its affiliates. All Rights Reserved.        #
+#                                                                                 #
+#  Licensed under the "MIT No Attribution" License (the "License"). You may not   #
+#  use this file except in compliance with the License. A copy of the             #
+#  License is located in the "license" file accompanying this file.               #
+#  This file is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS #
+#  OF ANY KIND, express or implied. See the License for the specific language     #
+#  governing permissions and limitations under the License.                       #
+###################################################################################
+
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: 
+  "SO0059 - AI Powered Health Data Masking"
+Mappings:
+  FunctionMap:
+    Configuration:
+        S3Bucket: "%%BUCKET_NAME%%"
+        S3Key: "ai-powered-health-data-masking/%%VERSION%%/"
+        SolutionID: "SO0059"
+  ApiGateway:
+    Defaults:
+      Name: IdentitifyAndMaskPhiApi
+      Stage: prod
+      Timeouts: 2900
+  Bucket:
+    Image:
+      DaysToIA: 30
+      DaysToGlacier: 180
+      MaskedImagePrefix: masked
+    Log:
+      ImagePrefix: image-bucket/
+      CloudTrailPrefix: cloudtrail-logs/
+  Lambda:
+    Defaults:
+      Runtime: python3.7
+      Handler: lambda_function.lambda_handler
+      Timeout: 30
+      MemorySize: 128
+    Environment:
+      PhiDetectionThreshold: 0.0
+      RedactedBoxColor: RED
+    MaskImage:
+      MemorySize: 1536
+  Send:
+    AnonymousUsage:
+        Data: "Yes"
+
+Resources:
+  # S3 Buckets
+  # Log Bucket
+  LogBucket:
+    Type: AWS::S3::Bucket
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W35
+            reason: This is the log bucket.
+    Properties:
+      AccessControl: LogDeliveryWrite
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: 
+              SSEAlgorithm: AES256
+  LogBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref LogBucket
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Sid: AWSCloudTrailAclCheck
+          Effect: Allow
+          Principal:
+            Service: cloudtrail.amazonaws.com
+          Action: "s3:GetBucketAcl"
+          Resource: !Sub arn:aws:s3:::${LogBucket}
+        - Sid: AWSCloudTrailWrite
+          Effect: Allow
+          Principal:
+            Service: cloudtrail.amazonaws.com
+          Action: "s3:PutObject"
+          Resource: !Sub arn:aws:s3:::${LogBucket}/AWSLogs/${AWS::AccountId}/*
+          Condition:
+            StringEquals:
+              "s3:x-amz-acl": "bucket-owner-full-control"
+  ImageBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: 
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: Tier Images
+            Status: Enabled
+            Transitions:
+            - StorageClass: STANDARD_IA
+              TransitionInDays: !FindInMap [ Bucket, Image, DaysToIA]
+            - StorageClass: GLACIER
+              TransitionInDays: !FindInMap [ Bucket, Image, DaysToGlacier ]
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LogBucket
+        LogFilePrefix: !Join [ "-", [!Ref "AWS::StackId", !FindInMap [ Bucket, Log, ImagePrefix ] ] ]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: True
+        BlockPublicPolicy: True
+        IgnorePublicAcls: True
+        RestrictPublicBuckets: True
+  ImageBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    DependsOn: ImageBucket
+    Properties:
+      Bucket: !Ref ImageBucket
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Deny
+          Principal: "*"
+          Action: "*"
+          Resource: !Sub ${ImageBucket.Arn}/*
+          Condition:
+            Bool:
+              "aws:SecureTransport": false
+
+  # CloudTrail
+  SolutionTrail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: LogBucketPolicy
+    Properties:
+      EnableLogFileValidation: True
+      IncludeGlobalServiceEvents: True
+      IsLogging: True
+      S3BucketName: !Ref LogBucket
+      
+  # API Instantiation
+  ApiGatewayAccountConfig:
+    Type: AWS::ApiGateway::Account
+    DependsOn: ApiGatewayLoggingRole
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiGatewayLoggingRole.Arn
+  ApiGatewayLoggingRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: IAM role needs to have permission to write to CloudWatch Logs. Cannot restrict further due to CFn dependency graph.
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: apigateway.amazonaws.com
+          Action: "sts:AssumeRole"
+      Path: "/"
+      Policies:
+      - PolicyName: root
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: "Allow"
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:DescribeLogGroups
+            - logs:DescribeLogStreams
+            - logs:PutLogEvents
+            - logs:GetLogEvents
+            - logs:FilterLogEvents
+            Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*
+  IdentifyAndMaskApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Join [ "", [ !FindInMap [ ApiGateway, Defaults, Name ], !Ref "AWS::StackId" ] ]
+  CloudWatchApiLogGroup:
+    Type: AWS::Logs::LogGroup
+  IdentifyAndMaskApiDeploy:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+    - GetImage
+    - GetImageText
+    - GetImagePhi
+    - PostImageMask
+    - PostTextPhi
+    - PostTextMask
+    Properties:
+      RestApiId: !Ref IdentifyAndMaskApi
+  IdentifyAndMaskApiStage:
+    Type: AWS::ApiGateway::Stage
+    DependsOn:
+    - IdentifyAndMaskApiDeploy
+    - CloudWatchApiLogGroup
+    Properties:
+      AccessLogSetting:
+        DestinationArn: !GetAtt CloudWatchApiLogGroup.Arn
+      DeploymentId: !Ref IdentifyAndMaskApiDeploy
+      RestApiId: !Ref IdentifyAndMaskApi
+      StageName: !FindInMap [ ApiGateway, Defaults, Stage ]
+
+  # GET /image
+  GetImage:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: AWS_IAM
+      HttpMethod: GET
+      ResourceId: !Ref ImageResource
+      RestApiId: !Ref IdentifyAndMaskApi
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetImageLambda.Arn}/invocations
+  ImageResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref IdentifyAndMaskApi
+      ParentId: !GetAtt IdentifyAndMaskApi.RootResourceId
+      PathPart: 'image'
+  GetImageLambda:
+    Type: AWS::Lambda::Function
+    DependsOn:
+    - GetImageLambdaRole
+    Properties:
+      Code:
+        S3Bucket: !Join [ '-', [ !FindInMap [ FunctionMap, Configuration, S3Bucket ], !Ref "AWS::Region" ] ]
+        S3Key: !Join [ '', [ !FindInMap [ FunctionMap, Configuration, S3Key ], 'get_image.zip' ] ]
+      MemorySize: !FindInMap [ Lambda, Defaults, MemorySize ]
+      Handler: !FindInMap [ Lambda, Defaults, Handler ]
+      Runtime: !FindInMap [ Lambda, Defaults, Runtime ]
+      Timeout: !FindInMap [ Lambda, Defaults, Timeout ]
+      Role: !GetAtt GetImageLambdaRole.Arn
+      Description: Lambda function that generates a presigned S3 URL for an image
+  GetImageLambdaInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt GetImageLambda.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${IdentifyAndMaskApi}/*/GET/image
+  GetImageLambdaRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: IAM role needs to have permission to write to CloudWatch Logs. Cannot restrict further due to CFn dependency graph.
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: root
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: "Allow"
+            Action:
+              - "logs:CreateLogGroup"
+              - "logs:CreateLogStream"
+              - "logs:PutLogEvents"
+            Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*
+          - Effect: Allow
+            Action: 
+            - s3:GetObject
+            Resource:
+            - !Sub ${ImageBucket.Arn}/*
+
+  # GET /image/text
+  GetImageText:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: AWS_IAM
+      HttpMethod: GET
+      ResourceId: !Ref ImageTextResource
+      RestApiId: !Ref IdentifyAndMaskApi
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetImageTextLambda.Arn}/invocations
+  ImageTextResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref IdentifyAndMaskApi
+      ParentId: !Ref ImageResource
+      PathPart: 'text'
+  GetImageTextLambda:
+    Type: AWS::Lambda::Function
+    DependsOn:
+    - GetImageTextLambdaRole
+    Properties:
+      Code:
+        S3Bucket: !Join [ '-', [ !FindInMap [ FunctionMap, Configuration, S3Bucket ], !Ref "AWS::Region" ] ]
+        S3Key: !Join [ '', [ !FindInMap [ FunctionMap, Configuration, S3Key ], 'get_image_text.zip' ] ]
+      MemorySize: !FindInMap [ Lambda, Defaults, MemorySize ]
+      Handler: !FindInMap [ Lambda, Defaults, Handler ]
+      Runtime: !FindInMap [ Lambda, Defaults, Runtime ]
+      Timeout: !FindInMap [ Lambda, Defaults, Timeout ]
+      Role: !GetAtt GetImageTextLambdaRole.Arn
+      Description: Lambda function that returns all text in an image residing in S3
+  GetImageTextLambdaInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt GetImageTextLambda.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${IdentifyAndMaskApi}/*/GET/image/text
+  GetImageTextLambdaRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: IAM role needs to have permission to write to CloudWatch Logs. Cannot restrict further due to CFn dependency graph.
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: root
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: "Allow"
+            Action:
+              - "logs:CreateLogGroup"
+              - "logs:CreateLogStream"
+              - "logs:PutLogEvents"
+            Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*
+          - Effect: Allow
+            Action: 
+            - s3:GetObject
+            Resource:
+            - !Sub ${ImageBucket.Arn}/*
+          - Effect: Allow
+            Action:
+            - rekognition:DetectText
+            Resource: "*"
+
+  # GET /image/phi
+  GetImagePhi:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: AWS_IAM
+      HttpMethod: GET
+      ResourceId: !Ref ImagePhiResource
+      RestApiId: !Ref IdentifyAndMaskApi
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetImagePhiLambda.Arn}/invocations
+  ImagePhiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref IdentifyAndMaskApi
+      ParentId: !Ref ImageResource
+      PathPart: 'phi'
+  GetImagePhiLambda:
+    Type: AWS::Lambda::Function
+    DependsOn:
+    - GetImagePhiLambdaRole
+    Properties:
+      Code:
+        S3Bucket: !Join [ '-', [ !FindInMap [ FunctionMap, Configuration, S3Bucket ], !Ref "AWS::Region" ] ]
+        S3Key: !Join [ '', [ !FindInMap [ FunctionMap, Configuration, S3Key ], 'get_image_phi.zip' ] ]
+      MemorySize: !FindInMap [ Lambda, Defaults, MemorySize ]
+      Handler: !FindInMap [ Lambda, Defaults, Handler ]
+      Runtime: !FindInMap [ Lambda, Defaults, Runtime ]
+      Timeout: !FindInMap [ Lambda, Defaults, Timeout ]
+      Role: !GetAtt GetImagePhiLambdaRole.Arn
+      Description: Lambda function that returns PHI in an image residing in S3
+      Environment:
+        Variables:
+          PHI_DETECTION_THRESHOLD: !FindInMap [ Lambda, Environment, PhiDetectionThreshold ]
+  GetImagePhiLambdaInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt GetImagePhiLambda.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${IdentifyAndMaskApi}/*/GET/image/phi
+  GetImagePhiLambdaRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: IAM role needs to have permission to write to CloudWatch Logs. Cannot restrict further due to CFn dependency graph.
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: root
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: "Allow"
+            Action:
+              - "logs:CreateLogGroup"
+              - "logs:CreateLogStream"
+              - "logs:PutLogEvents"
+            Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*
+          - Effect: Allow
+            Action: 
+            - s3:GetObject
+            Resource:
+            - !Sub ${ImageBucket.Arn}/*
+          - Effect: Allow
+            Action:
+            - rekognition:DetectText
+            - comprehendmedical:DetectPHI
+            Resource: "*"
+
+  # POST /image/mask
+  PostImageMask:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: AWS_IAM
+      HttpMethod: POST
+      ResourceId: !Ref ImageMaskResource
+      RestApiId: !Ref IdentifyAndMaskApi
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${PostImageMaskLambda.Arn}/invocations
+  ImageMaskResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref IdentifyAndMaskApi
+      ParentId: !Ref ImageResource
+      PathPart: 'mask'
+  PostImageMaskLambda:
+    Type: AWS::Lambda::Function
+    DependsOn:
+    - PostImageMaskLambdaRole
+    Properties:
+      Code:
+        S3Bucket: !Join [ '-', [ !FindInMap [ FunctionMap, Configuration, S3Bucket ], !Ref "AWS::Region" ] ]
+        S3Key: !Join [ '', [ !FindInMap [ FunctionMap, Configuration, S3Key ], 'mask_image.zip' ] ]
+      MemorySize: !FindInMap [ Lambda, MaskImage, MemorySize ]
+      Handler: !FindInMap [ Lambda, Defaults, Handler ]
+      Runtime: !FindInMap [ Lambda, Defaults, Runtime ]
+      Timeout: !FindInMap [ Lambda, Defaults, Timeout ]
+      Role: !GetAtt PostImageMaskLambdaRole.Arn
+      Description: Lambda function that masks PHI in an image residing in S3
+      Environment:
+        Variables:
+          PHI_DETECTION_THRESHOLD: !FindInMap [ Lambda, Environment, PhiDetectionThreshold ]
+          REDACTED_BOX_COLOR: !FindInMap [ Lambda, Environment, RedactedBoxColor]
+  PostImageMaskLambdaInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt PostImageMaskLambda.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${IdentifyAndMaskApi}/*/POST/image/mask
+  PostImageMaskLambdaRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: IAM role needs to have permission to write to CloudWatch Logs. Cannot restrict further due to CFn dependency graph.
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: root
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: "Allow"
+            Action:
+              - "logs:CreateLogGroup"
+              - "logs:CreateLogStream"
+              - "logs:PutLogEvents"
+            Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*
+          - Effect: Allow
+            Action: 
+            - s3:GetObject
+            Resource:
+            - !Sub ${ImageBucket.Arn}/*
+          - Effect: Allow
+            Action:
+            - s3:PutObject
+            Resource:
+            - !Join ["", [ !GetAtt ImageBucket.Arn, "/", !FindInMap [ Bucket, Image, MaskedImagePrefix ], "/*" ] ]
+          - Effect: Allow
+            Action:
+            - rekognition:DetectText
+            - comprehendmedical:DetectPHI
+            Resource: "*"
+      
+  TextResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref IdentifyAndMaskApi
+      ParentId: !GetAtt IdentifyAndMaskApi.RootResourceId
+      PathPart: 'text'
+
+  # POST /text/phi
+  PostTextPhi:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: AWS_IAM
+      HttpMethod: POST
+      ResourceId: !Ref TextPhiResource
+      RestApiId: !Ref IdentifyAndMaskApi
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${IdPhiInTextLambda.Arn}/invocations
+  TextPhiResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref IdentifyAndMaskApi
+      ParentId: !Ref TextResource
+      PathPart: 'phi'
+  IdPhiInTextLambda:
+    Type: AWS::Lambda::Function
+    DependsOn:
+    - IdPhiInTextLambdaRole
+    Properties:
+      Code:
+        S3Bucket: !Join [ '-', [ !FindInMap [ FunctionMap, Configuration, S3Bucket ], !Ref "AWS::Region" ] ]
+        S3Key: !Join [ '', [ !FindInMap [ FunctionMap, Configuration, S3Key ], 'get_text_phi.zip' ] ]
+      MemorySize: !FindInMap [ Lambda, Defaults, MemorySize ]
+      Handler: !FindInMap [ Lambda, Defaults, Handler ]
+      Runtime: !FindInMap [ Lambda, Defaults, Runtime ]
+      Timeout: !FindInMap [ Lambda, Defaults, Timeout ]
+      Role: !GetAtt IdPhiInTextLambdaRole.Arn
+      Description: Lambda function that takes in a string (text) and identifies potential PHI using Amazon Comprehend Medical PHId
+      Environment:
+        Variables:
+          PHI_DETECTION_THRESHOLD: !FindInMap [ Lambda, Environment, PhiDetectionThreshold ]
+  IdPhiInTextLambdaInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt IdPhiInTextLambda.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${IdentifyAndMaskApi}/*/POST/text/phi
+  IdPhiInTextLambdaRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: IAM role needs to have permission to write to CloudWatch Logs. Cannot restrict further due to CFn dependency graph.
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: root
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: "Allow"
+            Action:
+              - "logs:CreateLogGroup"
+              - "logs:CreateLogStream"
+              - "logs:PutLogEvents"
+            Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*
+          - Effect: Allow
+            Action: 
+            - comprehendmedical:DetectPHI
+            Resource: "*"
+
+  # POST /text/mask
+  PostTextMask:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: AWS_IAM
+      HttpMethod: POST
+      ResourceId: !Ref TextMaskResource
+      RestApiId: !Ref IdentifyAndMaskApi
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${MaskPhiInTextLambda.Arn}/invocations
+  TextMaskResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref IdentifyAndMaskApi
+      ParentId: !Ref TextResource
+      PathPart: 'mask'
+  MaskPhiInTextLambda:
+    Type: AWS::Lambda::Function
+    DependsOn:
+    - MaskPhiInTextLambdaRole
+    Properties:
+      Code:
+        S3Bucket: !Join [ '-', [ !FindInMap [ FunctionMap, Configuration, S3Bucket ], !Ref "AWS::Region" ] ]
+        S3Key: !Join [ '', [ !FindInMap [ FunctionMap, Configuration, S3Key ], 'mask_text.zip' ] ]
+      MemorySize: !FindInMap [ Lambda, Defaults, MemorySize ]
+      Handler: !FindInMap [ Lambda, Defaults, Handler ]
+      Runtime: !FindInMap [ Lambda, Defaults, Runtime ]
+      Timeout: !FindInMap [ Lambda, Defaults, Timeout ]
+      Role: !GetAtt MaskPhiInTextLambdaRole.Arn
+      Description: Lambda function that takes in a string (text) and masks potential PHI using Amazon Comprehend Medical PHId
+      Environment:
+        Variables:
+          PHI_DETECTION_THRESHOLD: !FindInMap [ Lambda, Environment, PhiDetectionThreshold ]
+  MaskPhiInTextLambdaInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt MaskPhiInTextLambda.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${IdentifyAndMaskApi}/*/POST/text/mask
+  MaskPhiInTextLambdaRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: IAM role needs to have permission to write to CloudWatch Logs. Cannot restrict further due to CFn dependency graph.
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: root
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: "Allow"
+            Action:
+              - "logs:CreateLogGroup"
+              - "logs:CreateLogStream"
+              - "logs:PutLogEvents"
+            Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*
+          - Effect: Allow
+            Action: 
+            - comprehendmedical:DetectPHI
+            Resource: "*"
+
+Outputs:
+  ApiGatewayInvokeURL:
+    Value: !Sub https://${IdentifyAndMaskApi}.execute-api.${AWS::Region}.amazonaws.com/${IdentifyAndMaskApiStage}
+  ApiGatewayId:
+    Value: !Ref IdentifyAndMaskApi
+  ApiGatewayStage:
+    Value: !Ref IdentifyAndMaskApiStage
+  ImageBucketName:
+    Value: !Ref ImageBucket
+  LogBucketName:
+    Value: !Ref LogBucket
+  ImageResourceId:
+    Value: !Ref ImageResource
+  ImageTextResourceId:
+    Value: !Ref ImageTextResource
+  ImagePhiResourceId:
+    Value: !Ref ImagePhiResource
+  ImageMaskResourceId:
+    Value: !Ref ImageMaskResource
+  TextPhiResourceId:
+    Value: !Ref TextPhiResource
+  TextMaskResourceId:
+    Value: !Ref TextMaskResource
+  
