@@ -7,7 +7,7 @@ sudo apt-get update
 sudo apt-get install zip sed wget -y
 sudo pip install --upgrade pip
 sudo pip install --upgrade setuptools
-sudo pip install --upgrade virtualenv```
+sudo pip install --upgrade virtualenv
 ```
 
 ## Building Lambda Package
@@ -21,7 +21,7 @@ For example: ./build-s3-dist.sh solutions
 The template will then expect the source code to be located in the solutions-[region_name] bucket
 
 ## CF template and Lambda function
-Located in deployment/dist
+Located in `deployment/dist`
 
 
 ***
