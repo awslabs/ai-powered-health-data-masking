@@ -1,3 +1,6 @@
+***Deprecation Notice*** - This AWS Solution has been archived and is no longer maintained by AWS. To discover other solutions, please visit the [AWS Solutions Library](https://aws.amazon.com/solutions).
+
+
 # AI Powered Health Data Masking
 Uses Amazon AI services to mask health data in images and text.
 
